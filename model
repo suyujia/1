@@ -1,0 +1,203 @@
+import torch
+import torch.nn as nn
+import torch.utils.model_zoo as model_zoo
+from torchvision import datasets, transforms, models
+import torch.tensor as tensor
+import argparse
+import torch.nn.functional as F
+import torch.optim as optim
+
+class CNN(nn.Module):
+
+    def __init__(self, num_classes=1000):
+        super(CNN, self).__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=11, stride=4, padding=2),
+                        nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2),
+            nn.Conv2d(64, 192, kernel_size=5, padding=2),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2),
+            nn.Conv2d(192, 384, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(384, 256, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, kernel_size=3, padding=1),
+        )
+
+        self.mid = nn.Sequential(
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(kernel_size=3, stride=2),
+        )
+
+        self.classifier = nn.Sequential(
+            nn.Dropout(),
+            nn.Linear(256 * 6 * 6, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(),
+            nn.Linear(4096, 4096),
+            nn.ReLU(inplace=True),
+            nn.Linear(4096, num_classes),
+        )
+
+    def forward(self, x):
+        features = self.features(x)
+        mid = self.mid(features)
+        x = mid.view(x.size(0), 256 * 6 * 6)
+        x = self.classifier(x)
+
+        return x, features.view(features.size(0), 256, 169)
+
+
+class NetVLAD(nn.Module):
+
+    def __init__(self, k: int,  # k means center number
+                 d: int,  # feature dim
+                 ):
+        super(NetVLAD, self).__init__()
+        self.fc = nn.Linear(d, k)
+        self.k_mean = torch.rand(k, d)
+        self.softmax = nn.Softmax(dim=2)
+
+    def forward(self, net_in: tensor,  # shape == [bs, n, d]
+                ):
+        x = net_in
+        belong = self.fc(x)                     # shape == [bs, n, k]
+        belong = self.softmax(belong)           # shape == [bs, n, k]
+        belong = belong.unsqueeze(dim=3)        # shape == [bs, n, k, 1]
+
+        x = x.unsqueeze(dim=2)                  # shape == [bs, n, 1, d]
+        k_mean = self.k_mean.unsqueeze(dim=0)   # shape == [1, k, d]
+        k_mean = k_mean.unsqueeze(dim=0)        # shape == [1, 1, k, d]
+        core = x - k_mean                       # shape == [bs, n, k, d]
+
+        x_sub_c = belong*core                   # shape == [bs, n, k, d]
+        v = torch.sum(x_sub_c, 1)               # shape == [bs, k, d]
+        v = F.normalize(v, dim=2)               # shape == [bs, k, d]
+        v = v.view(v.size(0), -1)               # shape == [bs, k*d]
+        v = F.normalize(v, dim=1)               # shape == [bs, k*d]
+
+        return v
+
+
+
+class Model(nn.Module):
+
+    def __init__(self):
+        super(Model, self).__init__()
+        self.cnn = CNN()
+        self.nvlad = NetVLAD(k=64, d=169)
+
+    def forward(self, x):
+        feature = self.cnn.forward(x)[1]
+        v = self.nvlad.forward(feature)
+        return v
+
+
+def train(args, model, device, train_loader, optimizer, epoch):
+    model.train()
+    correct = 0
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+        output = model(data)
+        pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
+        correct += pred.eq(target.view_as(pred)).sum().item()
+        print(correct)
+        criterion = nn.CrossEntropyLoss(size_average=False)
+        loss = criterion(output, target)
+        # loss = F.nll_loss(output, target)
+        loss.backward()
+        optimizer.step()
+        if batch_idx % args.log_interval == 0:
+            print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                epoch, batch_idx * len(data), len(train_loader.dataset),
+                100. * batch_idx / len(train_loader), loss.item()))
+            print('Accuracy: {}/{} ({:.0f}%)\n'.format(
+                correct, len(train_loader.dataset),
+                100. * correct / len(train_loader.dataset)))
+
+
+def test(args, model, device, test_loader):
+    model.eval()
+    test_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            criterion = nn.CrossEntropyLoss(size_average=False)
+            test_loss += criterion(output, target).item()  # sum up batch loss
+            pred = output.max(1, keepdim=True)[1]  # get the index of the max log-probability
+            correct += pred.eq(target.view_as(pred)).sum().item()
+
+    test_loss /= len(test_loader.dataset)
+    print('\nTest set: Average loss: {:.4f}, Accuracy: {}/{} ({:.0f}%)\n'.format(
+        test_loss, correct, len(test_loader.dataset),
+        100. * correct / len(test_loader.dataset)))
+
+
+def main():
+    # Training settings
+    parser = argparse.ArgumentParser(description='PyTorch Example')
+    parser.add_argument('--batch-size', type=int, default=15, metavar='N',
+                        help='input batch size for training (default: 64)')
+    parser.add_argument('--test-batch-size', type=int, default=1000, metavar='N',
+                        help='input batch size for testing (default: 1000)')
+    parser.add_argument('--epochs', type=int, default=4, metavar='N',
+                        help='number of epochs to train (default: 10)')
+    parser.add_argument('--lr', type=float, default=0.001, metavar='LR',
+                        help='learning rate (default: 0.001)')
+    parser.add_argument('--momentum', type=float, default=0.9, metavar='M',
+                        help='SGD momentum (default: 0.5)')
+    parser.add_argument('--no-cuda', action='store_true', default=False,
+                        help='disables CUDA training')
+    parser.add_argument('--seed', type=int, default=0, metavar='S',
+                        help='random seed (default: 1)')
+    parser.add_argument('--log-interval', type=int, default=1, metavar='N',
+                        help='how many batches to wait before logging training status')
+    args = parser.parse_args()
+    use_cuda = not args.no_cuda and torch.cuda.is_available()
+    torch.manual_seed(args.seed)
+    device = torch.device("cuda" if use_cuda else "cpu")
+
+    data_transform = transforms.Compose([
+        transforms.Resize((224, 224), 2),  # 对图像大小统一
+        transforms.RandomHorizontalFlip(),  # 图像翻转
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[  # 图像归一化
+            0.229, 0.224, 0.225])
+    ])
+
+    train_dataset = datasets.ImageFolder(root='../root/', transform=data_transform)
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+
+    test_dataset = datasets.ImageFolder(root='../root/', transform=data_transform)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=args.test_batch_size, shuffle=True, num_workers=0)
+
+    model = Model().to(device)
+    # 将预训练参数赋给cnn模型，并固定参数
+    alexnet = models.alexnet(pretrained=True)
+    for param in alexnet.parameters():
+        param.requires_grad = False
+    pretrained_dict = alexnet.state_dict()
+    model_dict = model.state_dict()
+    pretrained_dict = {k: v for k, v in pretrained_dict.items() if k in model_dict}
+    model_dict.update(pretrained_dict)
+    model.load_state_dict(model_dict)
+
+    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+
+    for epoch in range(1, args.epochs + 1):
+        train(args, model, device, train_loader, optimizer, epoch)
+        test(args, model, device, test_loader)
+
+
+if __name__ == '__main__':
+    main()
+
+
+
+
+
+
